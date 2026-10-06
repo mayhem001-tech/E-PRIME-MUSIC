@@ -1,0 +1,215 @@
+name: Build E PRIME MUSIC APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build E PRIME MUSIC APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+
+      - name: Find Android project
+        shell: bash
+        run: |
+          set -e
+
+          if [ -f "settings.gradle" ] || [ -f "settings.gradle.kts" ]; then
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+            echo "Android project found in root."
+            exit 0
+          fi
+
+          ZIP_FILE=$(find . -type f -iname "*.zip" -print -quit || true)
+
+          if [ -n "$ZIP_FILE" ]; then
+            echo "Found ZIP: $ZIP_FILE"
+
+            rm -rf .android-project
+            mkdir -p .android-project
+
+            unzip -q "$ZIP_FILE" -d .android-project
+
+            SETTINGS=$(find .android-project -type f \
+              \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+              -print -quit)
+
+            if [ -n "$SETTINGS" ]; then
+              PROJECT_DIR=$(dirname "$SETTINGS")
+              echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+              echo "Android project found at: $PROJECT_DIR"
+              exit 0
+            fi
+          fi
+
+          SETTINGS=$(find . -type f \
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            -not -path "./.git/*" \
+            -print -quit || true)
+
+          if [ -n "$SETTINGS" ]; then
+            PROJECT_DIR=$(dirname "$SETTINGS")
+            echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+            echo "Android project found at: $PROJECT_DIR"
+            exit 0
+          fi
+
+          echo "ERROR: No Android project found."
+          find . -maxdepth 4 -type f -print | sort
+          exit 1
+
+      - name: Check Android project
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+
+          if [ ! -f "settings.gradle" ] && [ ! -f "settings.gradle.kts" ]; then
+            echo "ERROR: settings.gradle not found."
+            exit 1
+          fi
+
+          if [ ! -d "app" ]; then
+            echo "ERROR: app folder not found."
+            exit 1
+          fi
+
+          echo "Android project is ready."
+
+      - name: Enable AndroidX
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+
+          touch gradle.properties
+
+          if grep -q '^android.useAndroidX=' gradle.properties; then
+            sed -i 's/^android.useAndroidX=.*/android.useAndroidX=true/' gradle.properties
+          else
+            echo 'android.useAndroidX=true' >> gradle.properties
+          fi
+
+          if grep -q '^android.enableJetifier=' gradle.properties; then
+            sed -i 's/^android.enableJetifier=.*/android.enableJetifier=true/' gradle.properties
+          else
+            echo 'android.enableJetifier=true' >> gradle.properties
+          fi
+
+          echo "AndroidX enabled."
+
+      - name: Fix MediaPlaybackService long to int
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+
+          FILE="app/src/main/java/com/eprimemusic/app/MediaPlaybackService.java"
+
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: $FILE was not found."
+            echo "Searching for MediaPlaybackService.java..."
+            find app -type f -name "MediaPlaybackService.java" -print
+            exit 1
+          fi
+
+          echo "Applying MediaPlaybackService fix..."
+
+          python3 - "$FILE" <<'PY'
+          import sys
+          from pathlib import Path
+
+          file = Path(sys.argv[1])
+          text = file.read_text(encoding="utf-8")
+
+          old = ".setState(state, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 1f)"
+          new = ".setState((int) state, PlaybackStateCompat.PLAYBACK_POSITION_UNKNOWN, 1f)"
+
+          if old in text:
+              text = text.replace(old, new)
+              file.write_text(text, encoding="utf-8")
+              print("Fix applied successfully.")
+          elif new in text:
+              print("Fix was already applied.")
+          else:
+              print("WARNING: Expected setState() line was not found.")
+              print("Searching for setState calls:")
+              for i, line in enumerate(text.splitlines(), 1):
+                  if ".setState(" in line:
+                      print(f"{i}: {line}")
+          PY
+
+          echo "Checking the relevant code:"
+          grep -n -A2 -B2 "setState" "$FILE" || true
+
+      - name: Install Gradle 8.13
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.13-bin.zip
+          unzip -q gradle-8.13-bin.zip
+          echo "$PWD/gradle-8.13/bin" >> "$GITHUB_PATH"
+
+      - name: Show Gradle version
+        run: gradle --version
+
+      - name: Build debug APK
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+
+          gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Find APK
+        run: |
+          set -e
+
+          echo "Searching for APK..."
+          find "$PROJECT_DIR" -type f -name "*.apk" -print
+
+          APK=$(find "$PROJECT_DIR" \
+            -type f \
+            -path "*/build/outputs/apk/debug/*.apk" \
+            | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          echo "APK found: $APK"
+
+          mkdir -p artifact
+          cp "$APK" artifact/E-PRIME-MUSIC-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: E-PRIME-MUSIC-APK
+          path: artifact/E-PRIME-MUSIC-debug.apk
+          if-no-files-found: error
+          retention-days: 30
